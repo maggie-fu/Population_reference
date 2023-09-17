@@ -1,0 +1,1618 @@
+---
+title: "09-ASXL1_Tcell_and_Rescue"
+author: "Maggie Fu"
+date: '2023-05-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Work directory
+setwd("/mnt/scratch/KoborLab/Personal_Folders/mfu/Projects/ASXL1/")
+# .libPaths(c("/mnt/koborlab-hpc/tools/R/library/4", 
+#             "/usr/local/lib/R/site-library",
+#             "/usr/lib/R/site-library", "/usr/lib/R/library"))
+
+# Packages
+## For loading DNAm data
+library(minfi)
+library(data.table)
+library(IlluminaHumanMethylationEPICv2manifest,lib.loc = "/mnt/scratch/KoborLab/R_Libs/4.2.2")
+# BiocManager::install("jokergoo/IlluminaHumanMethylationEPICv2anno.20a1.hg38")
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+# library(methylumi)
+# library(ewastools, lib.loc = "/mnt/scratch/KoborLab/R_Libs/4.2.2") # (supports EPIC_v2)
+## Preprocessing
+library(wateRmelon)
+## Basic data manipulation / plotting
+library(dplyr)
+library(ggplot2)
+library(ggvenn)
+## Cell type prediction
+library(FlowSorted.Blood.EPIC)
+library(ExperimentHub)
+library(pheatmap)
+library(eulerr)
+## DNAm age
+library(methylclock)
+## Parallel processing
+library(pbapply)
+## Enrichment analysis
+library(msigdbr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(fgsea)
+library(R.utils)
+library(missMethyl)
+## Color palette
+library(cartography)
+library(nord)
+
+# Define colors for plotting
+group.colors <- c("family control" = "#EBCB8BFF", "unrelated healthy control" = "#A3BE8CFF", "patient empty vector" ="#BF616AFF", "patient wild type" = "#B48EADFF")
+
+# Internal functions
+source("/mnt/scratch/KoborLab/Personal_Folders/mfu/Functions/DetPvalTestRG.R")
+source("/mnt/scratch/KoborLab/Personal_Folders/mfu/Functions/locfdr_LMM.R")
+source("/mnt/scratch/KoborLab/Personal_Folders/mfu/Functions/SexAgePrediction_RG.R")
+source("/mnt/scratch/KoborLab/Personal_Folders/mfu/Functions/BetaPlot.R")
+```
+
+## Preprocessing
+
+Try to keep the preprocessing steps similar to the whole blood analysis
+- Sample / probe QC
+- Funnorm
+- 
+
+#### Reading IDATs
+
+```{bash}
+cd /mnt/cifs/maggie.fu/fs/KoborLab/raw_data/BRAINSTORM-KoborArchive2014March/RAW Data - DNA methylation/RAW data - EPIC methylation/2023/Turvey_May2023
+scp -r * /mnt/scratch/KoborLab/Personal_Folders/mfu/Projects/ASXL1/raw/
+cd /mnt/scratch/KoborLab/Personal_Folders/mfu/Projects/ASXL1/raw/207057130152/
+mv *.idat ../
+rm -r 207057130152
+```
+
+```{r}
+rawDir <- "raw"
+targets <- read.metharray.sheet(rawDir)
+RGset <- read.metharray.exp(base = rawDir, targets = targets, extended = T, recursive = T)
+pheno <- pData(RGset)
+
+# reassign the annotation so that the minfi functions getBeta(), preprocessRaw() and others like preprocessNoob() will work
+annotation(RGset)["array"] <- "IlluminaHumanMethylationEPICv2"
+annotation(RGset)["annotation"] <- "20a1.hg38"
+(manifest <- getManifest(RGset))
+
+saveRDS(RGset, file = "RData/901-ASXL1_Tcell_RGset.rds")
+```
+
+### Normalization
+
+```{r}
+RGset <- readRDS("RData/901-ASXL1_Tcell_RGset.rds")
+anno <- readRDS("/mnt/scratch/KoborLab/Personal_Folders/mfu/Reference/EPICv2_fdat.rds")
+
+GRset <- preprocessFunnorm(RGset)
+```
+
+### Sample QC
+
+```{r}
+# EWAStools
+ewas_meth <- read_idats(pData(RGset)$Basename)
+ctrls <- control_metrics(ewas_meth)
+pData(GRset)$failed <- sample_failure(ctrls)
+table(pData(GRset)$failed)
+
+# minfi
+minfi_controlqc <- getQC(preprocessRaw(RGset))
+controlqc <- plotQC(minfi_controlqc)
+
+# Other checks
+out1 <- DetPBisCTest(RGset)
+out2 <- detectOutlier(as.matrix(getBeta(GRset))) %>% which(.) # Take too long to run
+out3 <- outlyx(RGset) 
+out4 <- locfdr_LMM(getBeta(GRset), pData(GRset))
+
+# No outliers! All samples' quality is good
+```
+
+### Probe QC
+
+```{r}
+detP <- minfi::detectionP(as(RGset, "RGChannelSet"))
+bc <- beadcount(RGset)
+RGset <- pfilter(RGset, pn = detP, bc = bc, pnthresh = 0.001)
+# 0 samples having 1 % of sites with a detection p-value greater than 0.001 were removed 
+# Samples removed:  
+# 8659 sites were removed as beadcount <3 in 5 % of samples 
+# 3535 sites having 1 % of samples with a detection p-value greater than 0.001 were removed 
+GRset <- preprocessFunnorm(RGset$mn)
+```
+
+### Remove duplicated probes???
+Weird duplicated probe names _TC / _BC - remove duplicated ones
+
+```{r}
+bt <- getBeta(GRset)
+probes <- gsub("_.*", "", rownames(bt)) %>% unique()
+bt_dup <- bt[duplicated(gsub("_.*", "", rownames(bt))), ] # remove these
+dim(bt_dup)
+bt_dup2 <- bt[!duplicated(gsub("_.*", "", rownames(bt))), ] # keep these
+dim(bt_dup2)
+
+GRset <- GRset[rownames(bt_dup2), ]
+rownames(GRset) <- gsub("_.*", "", rownames(GRset))
+
+dim(GRset) #923736      8
+dim(anno) #infinium-methylationepic-v-1-0-b5-manifest-file     52
+intersect(rownames(GRset), anno$IlmnID) %>% length() #721378 - why is the overlap so low???
+
+overlap <- intersect(rownames(GRset), anno$IlmnID)
+GRset <- GRset[overlap, ]
+rownames(anno) <- anno$IlmnID
+anno <- anno[overlap, ]
+```
+
+```{r}
+beta <- getBeta(GRset)
+meta <- pData(GRset)
+
+# Relabel things
+meta$Sample_Group <- gsub("sister|mom|Dad", "family control", meta$Sample_Group) %>% 
+    gsub("HC.*", "unrelated healthy control", .) %>% 
+    gsub("P_WT.*", "patient wild type", .) %>%
+    gsub("P_EU", "patient empty vector", .)
+meta$Sample_Name <- gsub("EU", "EV", meta$Sample_Name) %>% 
+    gsub("sister", "Sister", .) %>% 
+    gsub("mom", "Mom", .)
+meta$Sentrix_row <- gsub("C.*", "", meta$Array) %>% gsub("R", "", .) %>% as.integer()
+colnames(beta) <- meta$Sample_Name
+rownames(meta) <- meta$Sample_Name
+
+
+save(beta, meta, anno, file = "RData/902-ASXL1_Tcell_betas_norm.RData")
+```
+
+
+## Data exploration - cell type, DNAm age, sex, etc
+
+### Check sex
+
+```{r}
+BetaPlot <- function(bt, mt, var){
+    if(nrow(bt) > 20000){
+        n <- 20000
+    } else {
+        n <- nrow(bt)
+    }
+    bt.m <- reshape2::melt(bt[sample(1:nrow(bt),n),])
+    #remove NAs before plotting (otherwise get many non-inifnite warnings)
+    plt <- bt.m[which(!(is.na(bt.m$value))),]
+        
+    # Add meta
+    colnames(plt) <- c("CpG","ID","Beta")
+    plt <- merge(plt, mt, by.x = "ID", by.y = 0) %>% 
+        as.data.frame()
+        
+    ggplot(plt, aes(Beta, group = ID, color = get(var))) +
+        geom_density() +
+        theme_bw() +
+        labs(x = "DNAm Beta Value")
+}
+BetaPlot(beta[anno$CHR == "X", ], "predictedSex")
+BetaPlot(beta[anno$CHR == "Y", ], "predictedSex") 
+
+# Mom and Dad got switched 
+meta$Sample_Name[rownames(meta) == "Mom"] <- "Dad"
+meta$Sample_Name[rownames(meta) == "Dad"] <- "Mom"
+rownames(meta)[meta$Sample_Name == "Mom"] <- "Mom2"
+rownames(meta)[meta$Sample_Name == "Dad"] <- "Dad"
+rownames(meta)[meta$Sample_Name == "Mom"] <- "Mom" # id column keeps the original (wrong) labeling
+```
+
+### Check SNPs
+
+```{r}
+snps <- getSnpBeta(RGset)
+colnames(snps) <- meta$Sample_Group
+D <- dist(t(snps)) #snp probes
+hc <- hclust(D, method = "ward.D2")
+ggdendrogram(hc, rotate = TRUE)
+```
+
+### EstimateCellCounts2
+
+```{r}
+load("RData/902-ASXL1_Tcell_betas_norm.RData")
+
+dataset <- beta
+
+# ECC2 doesn't work - need to run homebrew MRP 
+source("../../Functions/MRP_accessory.R")
+source("../../Functions/pickCompProbesCaret.R")
+
+if (verbose)
+    cat("Loading Reference Dataset.\n")
+load("/mnt/scratch/KoborLab/Personal_Folders/mfu/Projects/MRP/reference/FlowSorted.BloodExtended.EPIC_FN.RData")
+
+sampType = rep("PB", ncol(dataset)) # c("PB", "CB")
+class = "betas" # c("rgset", "betas")
+norm = "QN.b" # c("Noob", "FN", "QN", "QN.b", "none")
+normComb = TRUE
+probeList = "Ttest" #c("Ttest", "Caret", "IDOL", "DHS")
+method = "CP" #c("CP", "RPC", "SVR")
+probeSelect = "both" #c("both", "any", "pval")
+conditions = NULL
+nProbes = 100
+verbose = TRUE
+plotRef = FALSE
+removenRBC = T
+EPIConly = F
+seed = 3
+reference = FlowSorted.BloodExtended.EPIC.FN # c(FlowSorted.CordBlood.450k.FN, FlowSorted.Blood.450k.FN, FlowSorted.Blood.EPIC.FN, FlowSorted.BloodExtended.EPIC.FN)
+cellTypes = c("Bas", "Bmem", "Bnv", "CD4mem", "CD4nv",
+              "CD8mem", "CD8nv", "Eos", "Mono", "Neu", "NK", "Treg")
+caretMods = c("EL", "BLR", "CART", "RF", "GBM", "RFEnNB", "RFEnSVM") # c("EL", "BLR", "CART", "RF", "GBM", "RFEnLDA", "RFEnRF", "RFEnNB", "RFEnSVM", "RFEnNN")
+
+require(dplyr)
+require(limma)
+require(genefilter)
+#require(FlowSorted.Blood.450k)
+require(FlowSorted.Blood.EPIC)
+#require(FlowSorted.CordBloodCombined.450k)
+require(IlluminaHumanMethylation450kmanifest)
+require(IlluminaHumanMethylationEPICmanifest)
+#require(ExperimentHub)
+#require(EpiDISH)
+#hub <- ExperimentHub()
+library(SIS)
+```
+
+#### Combine data / normalize
+
+```{r}
+if (verbose)
+    cat("Starting Cell Type Estimation.\n")
+# if (removenRBC == T) {
+#     cellTypes <- c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran")
+# } else {
+#     cellTypes <- c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran", "nRBC")
+# }
+if (norm == "FN") {
+    processMethod <- "preprocessFunnorm"
+    if (class == "betas") stop("A RGChannelSet is required for functional normalization")
+} else if (norm == "Noob") {
+    processMethod <- "preprocessNoob"
+    if (class == "betas") stop("A RGChannelSet or is required for Noob normalization")
+} else if (norm == "QN") {
+    processMethod <- "preprocessQuantile"
+    if (class == "betas") stop("A RGChannelSet is required for this quantile normalization method. If you only have betas, set normalization method to QN.b instead")
+} else if (norm == "QN.b") {
+    processMethod <- "normalizeQuantiles"
+    if (class == "rgset") stop("QN.b is exclusively for beta matrix input. Use QN instead if you have an RGChannelSet")
+}
+sampCT <- rep("WBC", ncol(dataset))
+if (norm != "none") {
+    processMethod <- get(processMethod)
+}
+
+### Data normalization
+if (verbose) 
+    cat("Combining Data with Flow Sorted Data and Normalizing.\n")
+if (class == "betas") {
+    # if (all(sampType %in% "CB")) {
+    #     ref <- betas(reference[pData(reference)$SampType == "CB", ])
+    # } else {
+    #     ref <- betas(reference)
+    # }
+    if (class(reference) == "MethyLumiSet"){
+        ref <- betas(reference)
+    } else if (class(reference) %in% c("RGChannelSetExtended", "RGChannelSet", "GenomicRatioSet")){
+        ref <- getBeta(reference)
+    }
+    commonprobe <- intersect(as.character(rownames(dataset)), as.character(rownames(ref)))
+    if (norm == "QN.b") { 
+        comb <- cbind(dataset[commonprobe, ], ref[commonprobe, ])
+        comb.n <- processMethod(comb) 
+        samp.n <- comb.n[, colnames(dataset)]
+        ref.n <- comb.n[, colnames(ref)]
+    } else if (norm == "none") {
+        samp.n <- dataset[commonprobe, ]
+        ref.n <- ref[commonprobe, ]
+    }
+} else {
+    dataset <- as(dataset, "RGChannelSet")
+    if (norm == "none") {
+        commonprobe <- intersect(as.character(rownames(dataset)), as.character(rownames(BloodCell)))
+        samp.n <- betas(BloodCell)[commonprobe, ]
+        ref.n <- getBeta(dataset)[commonprobe, ]
+        
+    } else if (normComb) { # Combine all the datasets and normalize
+        combRGset <- combineArrays(dataset, reference, outType = "IlluminaHumanMethylation450k")
+        combRGset.N <- processMethod(combRGset)
+        comb.n <- getBeta(combRGset.N)
+        samp.n <- comb.n[, colnames(dataset)]
+        ref.n <- comb.n[, colnames(reference)]
+    } 
+    
+}
+
+combMeta <- data.frame(sampleNames = c(colnames(samp.n), colnames(ref.n)),
+                       studyIndex = rep(c("user", "reference"), times = c(ncol(samp.n), ncol(ref.n))),
+                       sampleType = c(sampType, as.character(pData(reference)$SampType)),
+                       cellType = c(sampCT, as.character(pData(reference)$CellType)), 
+                       stringsAsFactors = FALSE)
+refMeta <- combMeta[combMeta$studyIndex == "reference", ]
+sampMeta <- combMeta[combMeta$studyIndex == "user", ]
+
+# save(ref.n, samp.n, combMeta, file = "MRPref_CHILD_FN_0.RData")
+# save(ref.n, samp.n, combMeta, file = "MRPref_CHILD_FN_1.RData")
+# save(ref.n, samp.n, combMeta, file = "MRPref_CHILD_FN_5.RData")
+```
+
+#### Pick probes
+
+```{r}
+### Pick probes and estimate weights
+if (verbose)
+    cat("Estimating Weights for Cell Type Prediction Based on Selected Probeset.\n")
+if (probeList == "Ttest") {
+    coefs <- pickCompProbes2(betas = ref.n, 
+                             meta = refMeta, 
+                             nP = nProbes,
+                             ct = cellTypes, 
+                             ps = probeSelect, 
+                             p.val = 0.05, 
+                             min.delta.beta = 0, 
+                             plot = plotRef) # Call the pickCompProbes2 function below to select the probes that can best discern cell types and calculate weights
+} else if (probeList == "Caret") {
+    coefs_caret <- pickCompProbesCaret(betas = ref.n, 
+                                       meta = refMeta, 
+                                       ct = cellTypes, 
+                                       caretMods = caretMods, # caretMods = c("EL", "BLR", "CART", "RF", "GBM", "LDA", "RFEnRF", "RFEnNB", "RFEnSVM", "RFEnNN")
+                                       verbose = verbose, 
+                                       filtern = 10000,
+                                       seed = seed)
+} else {
+    load("/mnt/scratch/KoborLab/Personal_Folders/mfu/Reference/Probe_libraries.RData")
+    if (probeList == "IDOL") {
+        if (unique(sampType) == "CB") {
+            pLib <- idol.c
+        } else if (nrow(samp.n) > 622399) {
+            pLib <- idol.a_EPIC
+        } else {
+            pLib <- idol.a_450
+        }
+    } else if (probeList == "DHS") {
+        pLib <- DHS
+    }
+    coefs <- pickCompProbes2(betas = ref.n, meta = refMeta, nP = nProbes, 
+                             ct = cellTypes, trainingProbes = pLib, plot = plotRef) 
+}
+
+```
+
+#### Estimate proportion
+
+```{r}
+### Estimate cell type proportion
+if (verbose)
+    cat("Estimating Composition Based on Selected Projection Method.\n")
+projectionMethod <- get(method)
+
+if (probeList == "Caret"){
+    out <- lapply(coefs_caret$probeCoefs, function(coefs){
+        mat <- samp.n[rownames(coefs), ]
+        mat <- as.matrix(mat[complete.cases(mat), ])
+        mat.cb <- mat[, sampMeta$sampleType == "CB"]
+        mat.pb <- mat[, sampMeta$sampleType == "PB"]
+        coefs.cb <- as.matrix(coefs)
+        coefs.pb <- coefs.cb[, colnames(coefs.cb) != "nRBC"] # For peripheral blood, remove nRBC in prediction
+        if (ncol(mat.cb) > 0) {
+            if (is.null(conditions)) counts.cb <- projectionMethod(samp.n = mat.cb, coef = coefs.cb) %>% 
+                    as.data.frame()# Using the weights generated in the last step to stimate the proportion of each cell type
+            else counts.cb <- projectionMethod(samp.n = mat.cb, coef = coefs.cb, conditions = conditions) %>% 
+                    as.data.frame()
+        } 
+        if (ncol(mat.pb) > 0) {
+            if (is.null(conditions)) counts.pb <- projectionMethod(samp.n = mat.pb, coef = coefs.pb) %>% 
+                    as.data.frame()
+            else counts.pb <- projectionMethod(samp.n = mat.pb, coef = coefs.pb, conditions = conditions) %>% 
+                    as.data.frame()
+            counts.pb$nRBC <- 0
+        }
+        if (exists("counts.cb") & exists("counts.pb")) {
+            counts <- rbind(counts.cb, counts.pb) %>% .[colnames(mat), ]
+        } else if (exists("counts.cb") & !exists("counts.pb")) {
+            counts <- counts.cb
+        } else if (!exists("counts.cb") & exists("counts.pb")) {
+            counts <- counts.pb
+        }
+        return(counts)
+    })
+} else {
+    mat <- samp.n[rownames(coefs), ]
+    mat <- as.matrix(mat[complete.cases(mat), ])
+    mat.cb <- mat[, sampMeta$sampleType == "CB"]
+    mat.pb <- mat[, sampMeta$sampleType == "PB"]
+    coefs.cb <- as.matrix(coefs)
+    coefs.pb <- coefs.cb[, colnames(coefs.cb) != "nRBC"]
+    if (ncol(mat.cb) > 0) {
+        if (is.null(conditions)) counts.cb <- projectionMethod(samp.n = mat.cb, coef = coefs.cb) %>% 
+                as.data.frame() 
+        else counts.cb <- projectionMethod(samp.n = mat.cb, coef = coefs.cb, conditions = conditions) %>% 
+                as.data.frame()
+    } 
+    if (ncol(mat.pb) > 0) {
+        if (is.null(conditions)) counts.pb <- projectionMethod(samp.n = mat.pb, coef = coefs.pb) %>% 
+                as.data.frame()
+        else counts.pb <- projectionMethod(samp.n = mat.pb, coef = coefs.pb, conditions = conditions) %>% 
+                as.data.frame()
+        counts.pb$nRBC <- 0
+    }
+    if (exists("counts.cb") & exists("counts.pb")) {
+        counts <- rbind(counts.cb, counts.pb) %>% .[colnames(mat), ]
+    } else if (exists("counts.cb") & !exists("counts.pb")) {
+        counts <- counts.cb
+    } else if (!exists("counts.cb") & exists("counts.pb")) {
+        counts <- counts.pb
+    }
+    out <- counts
+}
+
+# out <- list(counts = counts, coefs = coefs, betas.n = samp.n)
+```
+
+#### Plot cell type
+
+```{r}
+meta <- cbind(meta, out)
+
+BloodPlot <- function(mt, vartype = c("categorical", "continuous"), varname = NULL, 
+                      tissue = c("blood", "bloodextended", "cord")) {
+    
+    require(dplyr)
+    require(ggpubr)
+    require(gridExtra)
+    
+    if (tissue == "blood"){
+        ct <- c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran")
+    } else if (tissue == "bloodextended"){
+        ct <- c("Bas", "Bmem", "Bnv", "CD4mem", "CD4nv",
+                "CD8mem", "CD8nv", "Eos", "Mono", "Neu", "NK", "Treg")
+    } else if (tissue == "Cord"){
+        ct <- c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran", "nRBC")
+    }
+    counts <- mt[, c("Sample_Name", ct)] %>% as.data.table()
+    counts_plot <- melt(counts, id.vars = "Sample_Name")
+    covar <- mt[, c("Sample_Name", varname)]
+    plt <- merge(counts_plot, covar, by = "Sample_Name") %>% 
+        as.data.frame()
+    
+    p1 <- ggplot(plt, aes(get(varname), value, fill = get(varname))) +
+        geom_boxplot(alpha = 0.2) +
+        geom_point(shape = 21, aes(group = Sample_Name), 
+                   position = position_jitter(w = 0.1)) +
+        xlab(NULL) +
+        ylab("Cell Proportion") +
+        theme_bw() + 
+        theme(axis.text = element_text(size = 12, color = "black"),
+              axis.title = element_text(size = 14),
+              legend.text = element_text(size = 11),
+              legend.title = element_text(size = 14), 
+              strip.text = element_text(size = 14),
+              axis.text.x = element_blank(),
+              axis.ticks.x = element_blank()) +
+        facet_wrap(~ variable)
+    
+    # if (vartype == "categorical") {
+    #     p1 <- p1 + stat_compare_means(method = "t.test")
+    # } 
+    plot(p1)
+}
+
+BloodPlot(mt = meta, vartype = "categorical", varname = "Sample_Group", tissue = "bloodextended") + 
+    scale_fill_manual(values = group.colors) 
+
+# Compare predicted and flow cell type proportion
+
+cor.test(meta$CD4_perc_flow, meta$CD4_perc_DNAm)
+cor.test(meta$CD8_perc_flow, meta$CD8_perc_DNAm)
+
+ggplot(meta, aes(CD4_perc_DNAm, CD4_perc_flow)) + 
+    geom_smooth(method = "lm", color = "gray") + 
+    geom_point(aes(color = Sample_Group), size = 2.5) + 
+    scale_color_manual(values = group.colors) + 
+    theme_bw() + 
+    theme(text = element_text(size = 14))
+ggplot(meta, aes(CD8_perc_DNAm, CD8_perc_flow)) + 
+    geom_smooth(method = "lm", color = "gray") + 
+    geom_point(aes(color = Sample_Group), size = 2.5) + 
+    scale_color_manual(values = group.colors) + 
+    theme_bw() + 
+    theme(text = element_text(size = 14))
+```
+
+#### Make cell type PCs
+
+```{r}
+source("../../Functions/pcaCoDa_NG.R")
+
+ct <- meta[, c("CD4mem", "CD4nv", "CD8mem", "CD8nv", "Treg")] %>% 
+    as.data.frame()
+sum(ct==0) #Are there any proportions predicted to be 0?
+ct <- (ct + 0.0001) #If necessary, add the offset of 0.001
+min(ct) # Cannot be = or < 0
+
+pca_object <- pcaCoDa(ct)
+CTP <- as.data.frame(pca_object$scores)
+colnames(CTP) <- c("CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4")
+rownames(CTP) <- rownames(ct)
+identical(rownames(meta), rownames(CTP))
+meta <- cbind(meta, CTP)
+
+save(beta, meta, anno, file = "RData/902-ASXL1_Tcell_betas_norm.RData")
+```
+
+### DNAm age
+
+```{r}
+load("RData/902-ASXL1_Tcell_betas_norm.RData")
+
+# DNAm Age
+bt <- cbind(CpG = rownames(beta), as.data.frame(beta))
+cpgs.missing <- checkClocks(bt)
+DNAmage <- DNAmAge(bt, clocks = c("Horvath", "Hannum", "skinHorvath", "Levine", "Wu"))
+meta <- cbind(meta, DNAmage[, 2:6])
+meta$Sample_Group <- factor(meta$Sample_Group, level = c('unrelated healthy control', 'family control', 'patient empty vector', 'patient wild type'))
+
+ggplot(as.data.frame(meta), aes(Sample_Group, Horvath, fill = Sample_Group)) + 
+    geom_boxplot() + 
+    geom_point(size = 2) +
+    theme_bw() + 
+    scale_fill_manual(values = group.colors) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), 
+          text = element_text(size = 15)) + 
+    labs(x = "", y = "Horvath Epigenetic Clock DNAm Age", fill = "Sample Group")
+
+save(beta, meta, anno, file = "RData/902-ASXL1_Tcell_betas_norm.RData")
+```
+
+### Variable correlation matrix
+```{r}
+library(corrplot)
+plt <- meta[, c("Disease_Status", # Sample groups
+                "xMed", "yMed", "Sentrix_row", # Technical batch
+                "predictedSex", # demographic variables
+                "CD4mem", "CD4nv", "CD8mem", "CD8nv", "Treg", # cell type
+                "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", # Cell type PCs
+                "Horvath", "Hannum", "Levine", "skinHorvath", "Wu") # DNAm age
+            ] %>% as.data.frame()
+plt$Disease_Status <- plt$Disease_Status %>% 
+    gsub("Healthy control", 0, .) %>% 
+    gsub("ASXL1 rescue", 1, .) %>% 
+    gsub("ASXL1 variant", 2, .) %>% 
+    as.numeric()
+plt$predictedSex <- plt$predictedSex %>% 
+    gsub("F", 0, .) %>% 
+    gsub("M", 1, .) %>% 
+    as.numeric()
+
+# Calculate correlation statistics
+cor.mat <- cor(plt)
+
+# Calculate 
+cor.mtest <- function(mat, ...) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat<- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], ...)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+        }
+    }
+  colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+  p.mat
+}
+# matrix of the p-value of the correlation
+p.mat <- cor.mtest(plt)
+head(p.mat[, 1:5])
+
+library(RColorBrewer)
+corrplot(cor.mat, type="upper", order = "original", 
+         col = brewer.pal(n = 8, name = "RdBu"), 
+         tl.col = "black", tl.srt = 45,
+         p.mat = p.mat, sig.level = 0.05, 
+         pch.col = "gray", pch.cex = 2, diag = F)
+
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+corrplot(cor.mat, method = "color", col = col(200), 
+         type = "upper", order = "original", 
+         addCoef.col = "black", # Add coefficient of correlation
+         tl.col = "black", tl.srt = 45, #Text label color and rotation
+         # Combine with significance
+         p.mat = p.mat, sig.level = 0.05, 
+         insig = "n", diag = F)
+```
+
+
+### Check DNAm clustering - Hierarchical and PCA
+
+```{r}
+# Heatmap
+bt <- beta[sample(1:nrow(beta),50000), ]
+pheatmap(bt, show_rownames = F)
+
+# PCA
+source("../../Functions/heatscreesimple.R")
+PCA.C <- prcomp(beta)
+meta_cat <- meta[, c("predictedSex", "Sample_Group")] 
+colnames(meta_cat) <- c("Predicted_Sex", "Sample_Group")
+meta_con <- meta[, c("Sentrix_row", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4")] 
+heatscreesimple(PCA.C$rotation, PCA.C$sdev^2, meta_cat, meta_con, 5) # Don't need to adjust for batch!
+
+pcaObj <- PCA.C$rotation %>% as.data.frame() %>% cbind(., meta[, c("Sample_Group", "predictedSex")])
+group.colors <- c("family control" = "#EBCB8BFF", "unrelated healthy control" = "#A3BE8CFF", "patient empty vector" ="#BF616AFF", "patient wild type" = "#B48EADFF")
+ggplot(pcaObj, aes(PC1, PC2, color = Sample_Group, shape = predictedSex)) + 
+    geom_point(size = 4) + 
+    theme_bw() +
+    scale_color_manual(values = group.colors)
+```
+
+### Correct for cell type - correct for flow CD8 proportion
+Even though cell types are not in top PCs
+
+```{r}
+load("RData/902-ASXL1_Tcell_betas_norm.RData")
+
+residuals <- t(apply(beta, 1, function(x){
+    x <- as.numeric(x)
+    residuals(summary(lm(x ~ CD8_perc_flow, data = meta)))
+}))
+colnames(residuals) <- colnames(beta)
+adj.residuals <- residuals + matrix(apply(beta, 1, mean), nrow = nrow(residuals), ncol = ncol(residuals))
+adj.residuals[adj.residuals <= 0] <- 0.0001 # convert any values that are less than or equal to zero to 0.0001
+adj.residuals[adj.residuals > 1] <- 0.9999
+
+save(adj.residuals, file = "RData/902-ASXL1_Tcell_betas_ct_adjusted.RData")
+```
+
+## Data analysis
+
+### Check if the patient samples are outside the HC range
+
+```{r}
+load("RData/902-ASXL1_Tcell_betas_norm.RData")
+load("RData/902-ASXL1_Tcell_betas_ct_adjusted.RData")
+
+beta <- adj.residuals # if using cell type corrected betas
+
+# Compared to IQR / SD range
+meta$Disease_Status <- gsub(".*control", "Healthy control", meta$Sample_Group) %>% 
+    gsub(".*vector", "ASXL1 variant", .) %>% 
+    gsub(".*type", "ASXL1 rescue", .)
+
+# Subset for patient and HCs
+beta.pat <- beta[, "P_EV"]
+beta.res <- beta[, "P_WT ASXL1"]
+beta.ref <- beta[, meta$Disease_Status == "Healthy control"]
+
+# Calculate the reference range
+beta.refIQR <- apply(beta.ref, 1, function(x) {quantile(x, c(0.025, 0.25, 0.5, 0.75, 0.975))}) %>% t() %>% as.data.frame()
+beta.refIQR$iqr <- beta.refIQR[, 4] - beta.refIQR[, 2]
+beta.refIQR$beta.refIQRl <- beta.refIQR[, 2] - 1.5*beta.refIQR$iqr
+beta.refIQR$beta.refIQRh <- beta.refIQR[, 4] + 1.5*beta.refIQR$iqr
+beta.refSD <- apply(beta.ref, 1, sd)
+beta.refM <- apply(beta.ref, 1, mean)
+
+ASXL1.test <- cbind(beta.refIQR, beta.refSD, beta.refM, beta.pat, beta.res) %>% as.data.frame()
+ASXL1.test$beta.refSD2l <- ASXL1.test$beta.refM - (ASXL1.test$beta.refSD*2)
+ASXL1.test$beta.refSD2h <- ASXL1.test$beta.refM + (ASXL1.test$beta.refSD*2)
+ASXL1.test$beta.refSD3l <- ASXL1.test$beta.refM - (ASXL1.test$beta.refSD*3)
+ASXL1.test$beta.refSD3h <- ASXL1.test$beta.refM + (ASXL1.test$beta.refSD*3)
+ASXL1.test$beta.refSD4l <- ASXL1.test$beta.refM - (ASXL1.test$beta.refSD*4)
+ASXL1.test$beta.refSD4h <- ASXL1.test$beta.refM + (ASXL1.test$beta.refSD*4)
+ASXL1.test$beta.refSD5l <- ASXL1.test$beta.refM - (ASXL1.test$beta.refSD*5)
+ASXL1.test$beta.refSD5h <- ASXL1.test$beta.refM + (ASXL1.test$beta.refSD*5)
+
+# Set empty variable for tests
+ASXL1.test$IQR.test.pat <- NA
+ASXL1.test$IQR.test.res <- NA
+ASXL1.test$IQR2.test.pat <- NA
+ASXL1.test$IQR2.test.res <- NA
+ASXL1.test$SD2.test.pat <- NA
+ASXL1.test$SD2.test.res <- NA
+ASXL1.test$SD3.test.pat <- NA
+ASXL1.test$SD3.test.res <- NA
+ASXL1.test$SD4.test.pat <- NA
+ASXL1.test$SD4.test.res <- NA
+ASXL1.test$SD5.test.pat <- NA
+ASXL1.test$SD5.test.res <- NA
+
+for (i in 1:nrow(ASXL1.test)) {
+    if(beta.pat[i] < ASXL1.test[i, "2.5%"] | 
+       beta.pat[i] > ASXL1.test[i, "97.5%"]) {
+        ASXL1.test$IQR.test.pat[i] <- "s"
+    } else {
+        ASXL1.test$IQR.test.pat[i] <- "ns"
+    }
+    if(beta.res[i] < ASXL1.test[i, "2.5%"] | 
+       beta.res[i] > ASXL1.test[i, "97.5%"]) {
+        ASXL1.test$IQR.test.res[i] <- "s"
+    } else {
+        ASXL1.test$IQR.test.res[i] <- "ns"
+    }
+}
+for (i in 1:nrow(ASXL1.test)) {
+    if(beta.pat[i] < ASXL1.test[i, "beta.refIQRl"] | 
+       beta.pat[i] > ASXL1.test[i, "beta.refIQRh"]) {
+        ASXL1.test$IQR2.test.pat[i] <- "s"
+    } else {
+        ASXL1.test$IQR2.test.pat[i] <- "ns"
+    }
+    if(beta.res[i] < ASXL1.test[i, "beta.refIQRl"] | 
+       beta.res[i] > ASXL1.test[i, "beta.refIQRh"]) {
+        ASXL1.test$IQR2.test.res[i] <- "s"
+    } else {
+        ASXL1.test$IQR2.test.res[i] <- "ns"
+    }
+}
+for (i in 1:nrow(ASXL1.test)) {
+    if(beta.pat[i] < ASXL1.test[i, "beta.refSD2l"] | 
+       beta.pat[i] > ASXL1.test[i, "beta.refSD2h"]) {
+        ASXL1.test$SD2.test.pat[i] <- "s"
+    } else {
+        ASXL1.test$SD2.test.pat[i] <- "ns"
+    }
+    if(beta.res[i] < ASXL1.test[i, "beta.refSD2l"] | 
+       beta.res[i] > ASXL1.test[i, "beta.refSD2h"]) {
+        ASXL1.test$SD2.test.res[i] <- "s"
+    } else {
+        ASXL1.test$SD2.test.res[i] <- "ns"
+    }
+}
+for (i in 1:nrow(ASXL1.test)) {
+    if(beta.pat[i] < ASXL1.test[i, "beta.refSD3l"] | 
+       beta.pat[i] > ASXL1.test[i, "beta.refSD3h"]) {
+        ASXL1.test$SD3.test.pat[i] <- "s"
+    } else {
+        ASXL1.test$SD3.test.pat[i] <- "ns"
+    }
+    if(beta.res[i] < ASXL1.test[i, "beta.refSD3l"] | 
+       beta.res[i] > ASXL1.test[i, "beta.refSD3h"]) {
+        ASXL1.test$SD3.test.res[i] <- "s"
+    } else {
+        ASXL1.test$SD3.test.res[i] <- "ns"
+    }
+}
+for (i in 1:nrow(ASXL1.test)) {
+    if(beta.pat[i] < ASXL1.test[i, "beta.refSD4l"] | 
+       beta.pat[i] > ASXL1.test[i, "beta.refSD4h"]) {
+        ASXL1.test$SD4.test.pat[i] <- "s"
+    } else {
+        ASXL1.test$SD4.test.pat[i] <- "ns"
+    }
+    if(beta.res[i] < ASXL1.test[i, "beta.refSD4l"] | 
+       beta.res[i] > ASXL1.test[i, "beta.refSD4h"]) {
+        ASXL1.test$SD4.test.res[i] <- "s"
+    } else {
+        ASXL1.test$SD4.test.res[i] <- "ns"
+    }
+}
+for (i in 1:nrow(ASXL1.test)) {
+    if(beta.pat[i] < ASXL1.test[i, "beta.refSD5l"] | 
+       beta.pat[i] > ASXL1.test[i, "beta.refSD5h"]) {
+        ASXL1.test$SD5.test.pat[i] <- "s"
+    } else {
+        ASXL1.test$SD5.test.pat[i] <- "ns"
+    }
+    if(beta.res[i] < ASXL1.test[i, "beta.refSD5l"] | 
+       beta.res[i] > ASXL1.test[i, "beta.refSD5h"]) {
+        ASXL1.test$SD5.test.res[i] <- "s"
+    } else {
+        ASXL1.test$SD5.test.res[i] <- "ns"
+    }
+}
+
+sum(ASXL1.test$IQR.test.pat == "s") # 395147 / 358871
+sum(ASXL1.test$IQR.test.res == "s") # 363057 / 221819
+sum(ASXL1.test$IQR2.test.pat == "s") # 257476 / 92269
+sum(ASXL1.test$IQR2.test.res == "s") # 210664 / 46893
+
+hits_rescued <- rownames(ASXL1.test)[ASXL1.test$IQR2.test.pat == "s" & ASXL1.test$IQR2.test.res == "ns"] 
+length(hits_rescued) # 151880
+hits_not_rescued <- rownames(ASXL1.test)[ASXL1.test$IQR2.test.pat == "s" & ASXL1.test$IQR2.test.res == "s"] 
+length(hits_not_rescued) # 132792
+
+sum(ASXL1.test$SD2.test.pat == "s") # 264844 / 2766
+sum(ASXL1.test$SD2.test.res == "s") # 216981 / 1333
+sum(ASXL1.test$SD3.test.pat == "s") # 168067 / 0
+sum(ASXL1.test$SD3.test.res == "s") # 106935 / 0
+sum(ASXL1.test$SD4.test.pat == "s") # 106935 / 0
+sum(ASXL1.test$SD4.test.res == "s") # 62515 / 0
+sum(ASXL1.test$SD5.test.pat == "s") # 67239 / 0
+sum(ASXL1.test$SD5.test.res == "s") # 36362 / 0
+
+# Check for hyper / hypo methylation
+length(rownames(ASXL1.test)[ASXL1.test$SD2.test.pat == "s" & ASXL1.test$beta.pat > ASXL1.test$beta.refM]) # 81
+length(rownames(ASXL1.test)[ASXL1.test$SD2.test.pat == "s" & ASXL1.test$beta.pat < ASXL1.test$beta.refM]) # 2685
+length(rownames(ASXL1.test)[ASXL1.test$SD2.test.res == "s" & ASXL1.test$beta.res > ASXL1.test$beta.refM]) # 1209
+length(rownames(ASXL1.test)[ASXL1.test$SD2.test.res == "s" & ASXL1.test$beta.res < ASXL1.test$beta.refM]) # 124
+
+
+hits_rescued <- rownames(ASXL1.test)[ASXL1.test$SD2.test.pat == "s" & ASXL1.test$SD2.test.res == "ns"] 
+length(hits_rescued) # 50311 / 2766
+hits_not_rescued <- rownames(ASXL1.test)[ASXL1.test$SD2.test.pat == "s" & ASXL1.test$SD2.test.res == "s"] 
+length(hits_not_rescued) # 16928 / 0
+hits_messed_up <- rownames(ASXL1.test)[ASXL1.test$SD2.test.pat == "ns" & ASXL1.test$SD2.test.res == "s"] 
+length(hits_messed_up) # 19434 / 1333
+
+saveRDS(ASXL1.test, file = "RData/903-ASXL1_Tcell_global_test.rds")
+ASXL1.test.CC <- ASXL1.test
+saveRDS(ASXL1.test.CC, file = "RData/903-ASXL1_Tcell_global_test_ct_adjusted.rds")
+
+# hist(ASXL1.test$beta.refSD)
+# hist(ASXL1.test$beta.refM)
+
+# Make Heatmap
+beta <- beta[, c("HC1", "HC2", "HC3", "Dad", "Mom", "Sister", "P_EV", "P_WT ASXL1")] 
+plt <- beta[hits_rescued, ] #%>% 
+    # .[order(.[, "P_EV"]), ] 
+    # using the SD5 definition
+pheatmap(plt, # [sample(1:nrow(plt),50000),]
+         show_rownames = F, 
+         scale = "row", 
+         treeheight_row = 0, 
+         cluster_cols = F,
+         cluster_rows = T) # do not show clustering
+pheatmap(plt, # cannot plot all 75k
+         show_rownames = F, 
+         scale = "none", 
+         treeheight_row = 0, 
+         cluster_cols = F)
+
+plt <- beta[hits_not_rescued, ] 
+pheatmap(plt,  # using the SD5 definition
+         show_rownames = F, 
+         scale = "row", 
+         treeheight_row = 0, 
+         cluster_cols = F)
+pheatmap(plt,  # using the SD5 definition
+         show_rownames = F, 
+         scale = "none", 
+         treeheight_row = 0, 
+         cluster_cols = F)
+
+plt <- beta[hits_messed_up, ] 
+pheatmap(plt,  # using the SD5 definition
+         show_rownames = F, 
+         scale = "row", 
+         treeheight_row = 0, 
+         cluster_cols = F)
+pheatmap(plt,  # using the SD5 definition
+         show_rownames = F, 
+         scale = "none", 
+         treeheight_row = 0, 
+         cluster_cols = F)
+```
+
+#### Explore reference range comparison results
+
+##### Defining regions for DMR analysis
+```{r}
+anno <- readRDS("../../Reference/EPICv2_fdat.rds")
+anno <- anno[!is.na(anno$MAPINFO), ]
+anno <- anno[with(anno, order(CHR, MAPINFO)),]
+
+# Region for finding DMR
+anno$Mreg <- 1
+reg <- 1
+for (i in 2:nrow(anno)) {
+    if (anno$MAPINFO[i] - anno$MAPINFO[i-1] > 1000) {
+        reg <- reg + 1
+    }
+    anno$Mreg[i] <- reg
+}
+
+# Regions for gene region plotting
+anno$Mreg_plt <- 1
+reg <- 1
+for (i in 2:nrow(anno)) {
+    if (anno$MAPINFO[i] - anno$MAPINFO[i-1] > 10000) {
+        reg <- reg + 1
+    }
+    anno$Mreg_plt[i] <- reg
+}
+
+saveRDS(anno, file = "../../Reference/EPICv2_fdat_Mreg.rds")
+
+# anno$Mreg <- sapply(unique(anno$CHR), function(chr){
+#     i <- 1
+#     anno_chr <- anno[anno$CHR == chr, ] %>%
+#         .[order(.$MAPINFO), ]
+#     anno_chr$Mreg <- NA
+#     apply(anno_chr, 1, function(cpg){
+#         
+#     })
+# })
+
+anno_v2 <- readRDS("../../Reference/EPICv2_fdat_Mreg.rds")
+load("../../Reference/EPIC_fdat_Mreg.RData")
+anno_v1 <- fdat_EPIC_Mreg
+
+
+```
+
+##### Map hits to annotation - plot DMRs
+
+```{r}
+load("RData/902-ASXL1_Tcell_betas_norm.RData")
+ASXL1.test <- readRDS("RData/903-ASXL1_Tcell_global_test.rds")
+anno <- readRDS("../../Reference/EPICv2_fdat_Mreg.rds")
+source("../../Functions/plotmultigeneregion.R")
+source("../../Functions/plotGeneRegion.R")
+
+ASXL1.test.anno <- merge(ASXL1.test, anno[, c("CHR", "MAPINFO", "Mreg", "Mreg_plt", "UCSC_RefGene_Name", "GencodeCompV12_NAME")], by = 0)
+rownames(ASXL1.test.anno) <- ASXL1.test.anno$Row.names
+
+# Take the biggest DMRs
+hits.dmr <- table(ASXL1.test.anno[ASXL1.test.anno$SD5.test.pat == "s" & ASXL1.test.anno$SD5.test.res == "ns", "Mreg"]) %>% sort(decreasing = T) %>% .[.>3] 
+Mreg_size <- table(anno$Mreg)[names(hits.dmr)] # Also filter by proportion of hits in a region
+hits_rescued.dmr <- (hits.dmr / Mreg_size) %>% 
+    sort(decreasing = T) %>% 
+    .[. >= 0.7] %>% 
+    names(.) # At least 15% 
+
+# Make table of hits
+length(hits_rescued.dmr) #502 at Mreg size >= 5
+View(ASXL1.test.anno[ASXL1.test.anno$Mreg %in% hits_rescued.dmr, ])
+
+# ASXL1.test.dmr <- table(ASXL1.test.anno[test, "Mreg"]) %>% sort(decreasing = T) %>% .[.>=3] %>% names()
+hits_rescued.dmr.gene <- sapply(hits_rescued.dmr, function(x) {
+    test <- anno[anno$Mreg == x, "UCSC_RefGene_Name"] %>% 
+               strsplit2(., ";") %>%
+               as.vector() %>%
+               unique()
+    if (identical(test, character(0))) test <- ""
+    if (length(test) > 1) {
+        test <- test[test != ""]
+        test <- paste0(test, collapse = ", ")
+    }
+    return(test)
+}) 
+dmr.genes <- do.call(c, hits_rescued.dmr.gene)
+toString(shQuote(hits_rescued.dmr.gene))
+genes <- c('LOC101927342', 'MAP4K4', 'MIR143HG, LOC728264', 'KCNB2', 'TMEM125', 'LOC400794', 'DISC1, TSNAX-DISC1', '', 'CACNA2D3', '', '', 'NXPH1', 'RNF19A', 'OR8D4', 'MTUS2', 'ARFRP1')
+genes_plt <- genes
+# If byvar  = "Mreg"
+hits_rescued.dmr.geneanno <- anno[anno$Mreg %in% hits_rescued.dmr, ]
+# If byvar  = "UCSC_RefGene_Name"
+# hits_rescued.dmr.geneanno <- anno[grep(paste(genes_plt, collapse = "|"), anno$UCSC_RefGene_Name), ]
+
+group.colors <- c("family control" = "#EBCB8BFF", "unrelated healthy control" = "#A3BE8CFF", "patient empty vector" ="#BF616AFF", "patient wild type" = "#B48EADFF")
+mcolors <-  c("family control" = "#EBCB8BFF", "unrelated healthy control" = "gray", "patient empty vector" ="#BF616AFF", "patient wild type" = "#B48EADFF")
+malpha <-  c("family control" = 0.3, "unrelated healthy control" = 0.3, "patient empty vector" = 1, "patient wild type" = 1)
+plotmultigeneregion(bt = beta, # [, meta$Disease_Status == "Healthy Control" | rownames(meta) == "203077630141_R07C01"] 
+                    plist = hits_rescued.dmr, #genes_plt
+                    fdat = hits_rescued.dmr.geneanno,
+                    byvar = "Mreg", #UCSC_RefGene_Name
+                    colorvar = meta$Sample_Group, # [meta$Disease_Status == "Healthy Control" | rownames(meta) == "203077630141_R07C01"]
+                    cscale = group.colors, 
+                    ascale = malpha, 
+                    title = genes_plt, 
+                    hide.legend = T, 
+                    nCol = 4) 
+
+```
+
+#### Enrichment analysis - ORA
+Can only do ORA because no statistics is available
+
+```{r}
+# enrichment analysis with clusterProfiler
+R.utils::setOption("clusterProfiler.download.method","auto")
+
+# Define hits
+dmr_size <- 2 # To be called a DMR, the region needs to have at least this many DMs
+dmr_perc <- 0 # The hits need to encompass this percent of the region (to avoid very large regions with few hits)
+
+# Rescued
+hits.dmr <- table(ASXL1.test.anno[ASXL1.test.anno$SD5.test.pat == "s" & ASXL1.test.anno$SD5.test.res == "ns", "Mreg"]) %>% sort(decreasing = T) %>% .[.>=dmr_size] 
+Mreg_size <- table(anno$Mreg)[names(hits.dmr)] # Also filter by proportion of hits in a region
+hits_rescued.dmr <- (hits.dmr / Mreg_size) %>% 
+    sort(decreasing = T) %>% 
+    .[. >= dmr_perc] %>% # At least 30% 
+    names(.) 
+genes_rescued <- ASXL1.test.anno$UCSC_RefGene_Name[ASXL1.test.anno$Mreg %in% hits_rescued.dmr] %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""] # remove missing values
+
+# The code for converting gene name to entrez ID if needed
+# AnnotationDbi::select(org.Hs.eg.db,
+#                       keys = .,
+#                       columns = c("ENTREZID", "SYMBOL"),
+#                       keytype = "SYMBOL") 
+
+# Not rescued
+hits.dmr <- table(ASXL1.test.anno[ASXL1.test.anno$SD5.test.pat == "s" & ASXL1.test.anno$SD5.test.res == "s", "Mreg"]) %>% sort(decreasing = T) %>% .[.>=dmr_size] 
+Mreg_size <- table(anno$Mreg)[names(hits.dmr)] # Also filter by proportion of hits in a region
+hits_not_rescued.dmr <- (hits.dmr / Mreg_size) %>% 
+    sort(decreasing = T) %>% 
+    .[. >= dmr_perc] %>% 
+    names(.)
+genes_not_rescued <- ASXL1.test.anno$UCSC_RefGene_Name[ASXL1.test.anno$Mreg %in% hits_not_rescued.dmr] %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique()%>%
+    .[. != ""]
+
+# Messed up by WT ASXL1
+hits.dmr <- table(ASXL1.test.anno[ASXL1.test.anno$SD5.test.pat == "ns" & ASXL1.test.anno$SD5.test.res == "s", "Mreg"]) %>% sort(decreasing = T) %>% .[.>=dmr_size] 
+Mreg_size <- table(anno$Mreg)[names(hits.dmr)] # Also filter by proportion of hits in a region
+hits_messed_up.dmr <- (hits.dmr / Mreg_size) %>% 
+    sort(decreasing = T) %>% 
+    .[. >= dmr_perc] %>% 
+    names(.)
+genes_messed_up <- ASXL1.test.anno$UCSC_RefGene_Name[ASXL1.test.anno$Mreg %in% hits_messed_up.dmr] %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""]
+
+# EV
+hits.dmr <- table(ASXL1.test.anno[ASXL1.test.anno$SD5.test.pat == "s", "Mreg"]) %>% sort(decreasing = T) %>% .[.>=dmr_size] 
+Mreg_size <- table(anno$Mreg)[names(hits.dmr)] # Also filter by proportion of hits in a region
+hits_EV.dmr <- (hits.dmr / Mreg_size) %>% 
+    sort(decreasing = T) %>% 
+    .[. >= dmr_perc] %>% 
+    names(.)
+genes_EV <- ASXL1.test.anno$UCSC_RefGene_Name[ASXL1.test.anno$Mreg %in% hits_EV.dmr] %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""]
+
+# WT ASXL1
+hits.dmr <- table(ASXL1.test.anno[ASXL1.test.anno$SD5.test.res == "s", "Mreg"]) %>% sort(decreasing = T) %>% .[.>=dmr_size] 
+Mreg_size <- table(anno$Mreg)[names(hits.dmr)] # Also filter by proportion of hits in a region
+hits_WT.dmr <- (hits.dmr / Mreg_size) %>% 
+    sort(decreasing = T) %>% 
+    .[. >= dmr_perc] %>% 
+    names(.)
+genes_WT <- ASXL1.test.anno$UCSC_RefGene_Name[ASXL1.test.anno$Mreg %in% hits_WT.dmr] %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""]
+
+# Background genes measured on the array
+genes_universe <- ASXL1.test.anno$UCSC_RefGene_Name %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""] 
+
+# Hallmark enrichment - want to check IL2-STAT5 pathway
+gs_hallmark <- msigdbr(species = "human", category = "H")
+msigdbr_t2g <- gs_hallmark %>% 
+    dplyr::distinct(gs_name, gene_symbol) %>% 
+    as.data.frame 
+# msigdbr_t2g = h_gene_sets %>% dplyr::distinct(gs_name, entrez_gene) %>% as.data.frame()
+# enricher(gene = genes_rescued$ENTREZID, TERM2GENE = msigdbr_t2g, universe = genes_universe$ENTREZID)
+(pathway_rescued <- enricher(gene = genes_rescued, TERM2GENE = msigdbr_t2g, universe = genes_universe)) #"HALLMARK_MYOGENESIS" "HALLMARK_HEDGEHOG_SIGNALING"
+(pathway_not_rescued <- enricher(gene = genes_not_rescued, TERM2GENE = msigdbr_t2g, universe = genes_universe)) #"HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION" "HALLMARK_ESTROGEN_RESPONSE_EARLY" "HALLMARK_ESTROGEN_RESPONSE_LATE" "HALLMARK_MYOGENESIS"
+(pathway_messed_up <- enricher(gene = genes_messed_up, TERM2GENE = msigdbr_t2g, universe = genes_universe))
+(pathway_EV <- enricher(gene = genes_EV, TERM2GENE = msigdbr_t2g, universe = genes_universe)) # "HALLMARK_MYOGENESIS" "HALLMARK_ESTROGEN_RESPONSE_EARLY" "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION" "HALLMARK_ANGIOGENESIS" "HALLMARK_HEDGEHOG_SIGNALING" "HALLMARK_COAGULATION" "HALLMARK_ESTROGEN_RESPONSE_LATE" "HALLMARK_APICAL_JUNCTION"
+(pathway_WT <- enricher(gene = genes_WT, TERM2GENE = msigdbr_t2g, universe = genes_universe)) # "HALLMARK_UV_RESPONSE_DN" "HALLMARK_ANDROGEN_RESPONSE"
+
+gs_all <- msigdbr(species = "human")
+gs_immune <- gs_all %>%
+    dplyr::filter(gs_cat == "C7" & gs_subcat == "IMMUNESIGDB") %>%
+    head()
+msigdbr_t2g <- immune_gs %>% 
+    dplyr::distinct(gs_name, gene_symbol) %>% 
+    as.data.frame 
+(pathway_rescued <- enricher(gene = genes_rescued, TERM2GENE = msigdbr_t2g, universe = genes_universe)) #"HALLMARK_MYOGENESIS" "HALLMARK_HEDGEHOG_SIGNALING"
+#  [1] "GSE10147_IL3_VS_IL3_AND_HIVP17_STIM_PDC_DN"                                  "GSE22886_IL2_VS_IL15_STIM_NKCELL_UP"                                         "GSE21380_TFH_VS_GERMINAL_CENTER_TFH_CD4_TCELL_UP"      
+#  [4] "GSE10239_MEMORY_VS_KLRG1HIGH_EFF_CD8_TCELL_UP"                               "GSE9946_IMMATURE_VS_MATURE_STIMULATORY_DC_DN"                                "GSE45739_UNSTIM_VS_ACD3_ACD28_STIM_NRAS_KO_CD4_TCELL_DN"  
+#  [7] "GSE19825_NAIVE_VS_IL2RAHIGH_DAY3_EFF_CD8_TCELL_UP"                           "GSE29164_DAY3_VS_DAY7_CD8_TCELL_AND_IL12_TREATED_MELANOMA_DN"                "GSE360_DC_VS_MAC_T_GONDII_UP"                             
+# [10] "GSE21379_WT_VS_SAP_KO_TFH_CD4_TCELL_UP"                                      "GSE40666_UNTREATED_VS_IFNA_STIM_EFFECTOR_CD8_TCELL_90MIN_UP"                 "GSE3203_WT_VS_IFNAR1_KO_INFLUENZA_INFECTED_LN_BCELL_DN"   
+# [13] "GSE2405_HEAT_KILLED_LYSATE_VS_LIVE_A_PHAGOCYTOPHILUM_STIM_NEUTROPHIL_24H_DN" "GSE7568_CTRL_VS_3H_TGFB_TREATED_MACROPHAGES_WITH_IL4_AND_DEXAMETHASONE_UP"   "GSE13887_ACT_CD4_VS_NO_TREATED_CD4_TCELL_UP"           
+# [16] "GSE2405_0H_VS_1.5H_A_PHAGOCYTOPHILUM_STIM_NEUTROPHIL_UP"
+
+ego <- enrichGO(gene          = genes_rescued,
+                universe      = genes_universe,
+                OrgDb         = org.Hs.eg.db,
+                keyType       = "SYMBOL", #idType(OrgDb) for available keyTypes
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+                qvalueCutoff  = 0.05,
+                readable      = TRUE)
+head(ego)
+
+
+# ann <- getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+
+# GO pathways
+GE_EV.go <- gometh(rownames(ASXL1.test.anno)[ASXL1.test.anno$SD4.test.pat == "s"],
+                   rownames(ASXL1.test.anno), 
+                   "GO", "EPIC", T, anno = anno)
+GE_EV.go[GE_EV.go$ONTOLOGY == "BP", ] %>% .[order(.$P.DE), ] %>% head()
+GE_WT.go <- gometh(rownames(ASXL1.test.anno)[ASXL1.test.anno$SD4.test.res == "s"],
+                   rownames(ASXL1.test.anno), 
+                   "GO", "EPIC", T, anno = anno)
+GE_WT.go[GE_WT.go$ONTOLOGY == "BP", ] %>% .[order(.$P.DE), ]
+GE_rescued.go <- gometh(rownames(ASXL1.test.anno)[ASXL1.test.anno$SD4.test.pat == "s" & ASXL1.test.anno$SD4.test.res == "ns"],
+                        rownames(ASXL1.test.anno), 
+                        "GO", "EPIC", T, anno = anno)
+GE_rescued.go[GE_rescued.go$ONTOLOGY == "BP", ] %>% .[order(.$P.DE), ] %>% head()
+GE_not_rescued.go <- gometh(rownames(ASXL1.test.anno)[ASXL1.test.anno$SD4.test.pat == "s" & ASXL1.test.anno$SD4.test.res == "s"],
+                            rownames(ASXL1.test.anno), 
+                            "GO", "EPIC", T, anno = anno)
+GE_not_rescued.go[GE_not_rescued.go$ONTOLOGY == "BP", ] %>% .[order(.$P.DE), ] %>% head()
+GE_messed_up.go <- gometh(rownames(ASXL1.test.anno)[ASXL1.test.anno$SD4.test.pat == "ns" & ASXL1.test.anno$SD4.test.res == "s"],
+                          rownames(ASXL1.test.anno), 
+                          "GO", "EPIC", T, anno = anno)
+GE_messed_up.go[GE_messed_up.go$ONTOLOGY == "BP", ] %>% .[order(.$P.DE), ] %>% head()
+
+# KEGG
+GE_EV.kegg <- gometh(rownames(ASXL1.test.anno)[ASXL1.test.anno$SD4.test.pat == "s"],
+                     rownames(ASXL1.test.anno),
+                     "KEGG", "EPIC", T, anno = anno)
+GE_EV.kegg[order(GE_EV.kegg$FDR), ]
+GE_WT.kegg <- gometh(rownames(ASXL1.test.anno)[ASXL1.test.anno$SD4.test.res == "s"],
+                   rownames(ASXL1.test.anno), 
+                   "KEGG", "EPIC", T, anno = anno)
+GE_WT.kegg[order(GE_WT.kegg$FDR), ]
+GE_rescued.kegg <- gometh(rownames(ASXL1.test.anno)[ASXL1.test.anno$SD4.test.pat == "s" & ASXL1.test.anno$SD4.test.res == "ns"],
+                        rownames(ASXL1.test.anno), 
+                        "KEGG", "EPIC", T, anno = anno)
+GE_rescued.kegg[order(GE_rescued.kegg$FDR), ]
+GE_not_rescued.kegg <- gometh(rownames(ASXL1.test.anno)[ASXL1.test.anno$SD4.test.pat == "s" & ASXL1.test.anno$SD4.test.res == "s"],
+                            rownames(ASXL1.test.anno), 
+                            "KEGG", "EPIC", T, anno = anno)
+GE_not_rescued.kegg[order(GE_not_rescued.kegg$FDR), ]
+GE_messed_up.kegg <- gometh(rownames(ASXL1.test.anno)[ASXL1.test.anno$SD4.test.pat == "ns" & ASXL1.test.anno$SD4.test.res == "s"],
+                          rownames(ASXL1.test.anno), 
+                          "KEGG", "450K", T, anno = anno)
+GE_messed_up.kegg[GE_messed_up.kegg$ONTOLOGY == "BP", ] %>% .[order(.$P.DE), ]
+GE_messed_up.kegg[order(GE_messed_up.kegg$FDR), ]
+
+save(GE_EV.go, GE_WT.go, GE_rescued.go, GE_not_rescued.go, GE_messed_up.go, 
+     # GE_EV.kegg, GE_WT.kegg, GE_rescued.kegg, GE_not_rescued.kegg, GE_messed_up.kegg, 
+     file = "RData/904-ASXL1_Tcell_HCreference_ORA_Enrichment.RData")
+```
+
+
+
+### Permutation test
+
+```{r}
+# Compared to IQR / SD range
+load("RData/902-ASXL1_Tcell_betas_norm.RData")
+
+# Set progress bar
+set.seed(1234)
+permTest <- function(cpg, group, group_var, n) {
+    g <- unique(group)
+    m0 <- mean(cpg[group == group_var]) # find the average DNAm level for group_var (in this case patient sample)
+    m1 <- sapply(n, function(x) {
+        ngroup <- sample(group, length(group)) # random shuffling of labels
+        mean(cpg[ngroup == group_var]) # find the average DNAm level for randomly labelled samples
+    })
+    out <- c(sum(m0>=m1), sum(m0<=m1))
+    return(out)
+}
+# permTest2 <- function(cpg, group, n) {
+#     g <- unique(group)
+#     test <- sapply(n, function(x) {
+#         ngroup <- sample(group, length(group)) # random shuffling of labels
+#         m <- mean(cpg[ngroup == group_var])
+#         ipr <- quantile(cpg[ngroup == "Healthy control"], c(0.025, 0.975))
+#         return(c(mean = m, ipr))
+#     }) %>% t() %>% as.data.frame()
+#     out <- sum(test$mean < test$"2.5%" | test$mean > test$"97.5%")
+#     return(out)
+# } This test makes no sense currently 
+N <- 1000
+cl <- 10
+
+# Check patient vs HC - sign test
+beta.t <- beta[, colnames(beta) != "P_WT ASXL1"]
+meta.t <- meta[colnames(beta.t), ]
+permOut.EV <- pbapply(beta.t, 1, function(x) permTest(x, meta.t$Disease_Status, "ASXL1 variant", 1:N), cl = cl) %>% t() %>% as.data.frame()
+permOut.EV <- permOut.EV/N
+colnames(permOut.EV) <- c("Hypo_pval", "Hyper_pval")
+permOut.EV$Hypo_qval <- p.adjust(permOut.EV$Hypo_pval)
+permOut.EV$Hyper_qval <- p.adjust(permOut.EV$Hyper_pval)
+
+# Check rescue vs HC - sign test
+beta.t <- beta[, colnames(beta) != "P_EV"]
+meta.t <- meta[colnames(beta.t), ]
+permOut.WT <- pbapply(beta.t, 1, function(x) permTest(x, meta.t$Disease_Status, "ASXL1 rescue", 1:N), cl = cl) %>% t() %>% as.data.frame()
+permOut.WT <- permOut.WT/N
+colnames(permOut.WT) <- c("Hypo_pval", "Hyper_pval")
+permOut.WT$Hypo_qval <- p.adjust(permOut.WT$Hypo_pval)
+permOut.WT$Hyper_qval <- p.adjust(permOut.WT$Hyper_pval)
+
+save(permOut.EV, permOut.WT, file = "RData/903-ASXL1_Tcell_permutation_sign_test.RData")
+
+# # Check patient vs HC - iqr test
+# beta.t <- beta[, colnames(beta) != "P_WT ASXL1"] 
+# meta.t <- meta[colnames(beta.t), ]
+# permOut2.pat <- pbapply(beta.t, 1, function(x) permTest2(x, meta.t$Disease_Status, "ASXL1 variant", 1:N), cl = cl) %>% t()
+# permOut2.pat <- as.data.frame(permOut2.pat/N)
+# colnames(permOut2.pat) <- c("pval")
+# permOut2.pat$Hypo_qval <- p.adjust(permOut2.pat$Hypo_pval)
+# permOut2.pat$Hyper_qval <- p.adjust(permOut2.pat$Hyper_pval)
+# 
+# # Check rescue vs HC - iqr test
+# beta.t <- beta[, colnames(beta) != "P_EV"]
+# meta.t <- meta[colnames(beta.t), ]
+# permOut2.res <- pbapply(beta.t, 1, function(x) permTest2(x, meta.t$Disease_Status, "ASXL1 rescue", 1:N), cl = cl) %>% t() %>% as.data.frame(./N)
+# colnames(permOut2.res) <- c("Hypo_pval", "Hyper_pval")
+# permOut2.res$Hypo_qval <- p.adjust(permOut2.res$Hypo_pval)
+# permOut2.res$Hyper_qval <- p.adjust(permOut2.res$Hyper_pval)
+# 
+# save(permOut2.pat, permOut2.res, file = "RData/904-ASXL1_Tcell_permutation_iqr_test.RData")
+
+# Check overlap
+cutoff <- 1/7 # Likelihood for patient sample to get picked
+test.hyper <- intersect(rownames(permOut.EV)[permOut.EV$Hyper_qval < cutoff], rownames(permOut.WT)[permOut.WT$Hyper_pval < cutoff]) # 77 vs 0
+test.hypo <- intersect(rownames(permOut.EV)[permOut.EV$Hypo_pval < cutoff], rownames(permOut.WT)[permOut.WT$Hypo_pval < cutoff]) # 207 vs 0
+# test2.hyper <- intersect(rownames(permOut2.pat)[permOut2.pat$Hyper_pval < cutoff], rownames(permOut2.res)[permOut2.res$Hyper_pval < cutoff]) # 28 / 185
+# test2.hypo <- intersect(rownames(permOut2.pat)[permOut2.pat$Hypo_pval < cutoff], rownames(permOut2.res)[permOut2.res$Hypo_pval < cutoff]) # 28 / 185
+length(rownames(permOut.EV)[permOut.EV$Hyper_pval < cutoff]) # 48515
+length(rownames(permOut.EV)[permOut.EV$Hypo_pval < cutoff]) # 137860
+length(rownames(permOut.WT)[permOut.WT$Hyper_pval < cutoff]) # 94067
+length(rownames(permOut.WT)[permOut.WT$Hypo_pval < cutoff]) # 76163
+length(intersect(rownames(permOut2.pat)[permOut2.pat$pval < cutoff], rownames(permOut2.res)[permOut2.res$pval < cutoff]))
+
+# Make heatmap
+plt.hyper <- beta[rownames(permOut.EV)[permOut.EV$Hyper_pval < cutoff], ] %>% 
+    .[.]
+plt.hypo <- beta[rownames(permOut.EV)[permOut.EV$Hypo_pval < cutoff], ]
+pheatmap(plt.hyper, show_rownames = F, scale = "row", treeheight_row = 0)
+pheatmap(plt.hypo[sample(1:nrow(plt.hypo), 50000), ], show_rownames = F, scale = "row", treeheight_row = 0)
+
+plt.hyper <- beta[rownames(permOut.WT)[permOut.WT$Hyper_pval < cutoff], ]
+plt.hypo <- beta[rownames(permOut.WT)[permOut.WT$Hypo_pval < cutoff], ]
+pheatmap(plt.hyper[sample(1:nrow(plt.hypo), 50000), ], show_rownames = F, scale = "row", treeheight_row = 0)
+pheatmap(plt.hypo[sample(1:nrow(plt.hypo), 50000), ], show_rownames = F, scale = "row", treeheight_row = 0)
+
+pheatmap(rbind(plt.hyper, plt.hypo), show_rownames = F, scale = "row")
+```
+
+#### Enrichment Analysis - preranked GSEA
+
+```{r}
+# Genes involved in the hits
+
+# Enrichment analysis
+```
+
+### Limma
+
+```{r}
+load("RData/902-ASXL1_Tcell_betas_norm.RData")
+load("RData/902-ASXL1_Tcell_betas_ct_adjusted.RData")
+
+beta <- adj.residuals
+
+# Check patient vs HC - Limma
+beta.t <- beta[, colnames(beta) != "P_WT ASXL1"]
+meta.t <- meta[colnames(beta.t), ]
+
+design <- model.matrix(~Disease_Status + predictedSex + CD8_perc_flow, data = meta.t)
+fit <- lmFit(beta.t, design)
+fit <- eBayes(fit)
+limmaOut <- topTable(fit, coef = 2, adjust = "BH", number = nrow(beta.t))
+dim(limmaOut.EV <- merge(limmaOut[limmaOut$adj.P.Val < 0.2, ], anno[, c("CHR", "MAPINFO", "Mreg", "Mreg_plt", "UCSC_RefGene_Name", "GencodeCompV12_NAME")], by = 0) %>%
+    .[order(.$P.Value, decreasing = F), ])
+rownames(limmaOut.EV) <- as.character(limmaOut.EV$Row.names)
+limmaOut.EV_up <- limmaOut.EV[limmaOut.EV$logFC < 0, ]
+limmaOut.EV_down <- limmaOut.EV[limmaOut.EV$logFC > 0, ]
+
+# Check WT ASXL1 vs HC - Limma
+beta.t <- beta[, colnames(beta) != "P_EV"]
+meta.t <- meta[colnames(beta.t), ]
+
+design <- model.matrix(~Disease_Status + predictedSex + CD8_perc_flow, data = meta.t)
+fit <- lmFit(beta.t, design)
+fit <- eBayes(fit)
+limmaOut <- topTable(fit, coef = 2, adjust = "BH", number = nrow(beta.t))
+dim(limmaOut.WT <- merge(limmaOut[limmaOut$adj.P.Val < 0.2, ], anno[, c("CHR", "MAPINFO", "Mreg", "Mreg_plt", "UCSC_RefGene_Name", "GencodeCompV12_NAME")], by = 0) %>%
+    .[order(.$P.Value, decreasing = F), ])
+rownames(limmaOut.WT) <- as.character(limmaOut.WT$Row.names)
+limmaOut.WT_up <- limmaOut.WT[limmaOut.WT$logFC < 0, ] #5012
+limmaOut.WT_down <- limmaOut.WT[limmaOut.WT$logFC > 0, ] #1444
+
+# Check overlap between EV and WT
+length(intersect(limmaOut.EV_up$Row.names, limmaOut.WT_up$Row.names)) #3196
+length(intersect(limmaOut.EV_down$Row.names, limmaOut.WT_down$Row.names)) #1299
+limmaOut.shared <- c(intersect(limmaOut.EV_up$Row.names, limmaOut.WT_up$Row.names), 
+                  intersect(limmaOut.EV_down$Row.names, limmaOut.WT_down$Row.names))
+
+# Save results
+save(limmaOut.EV, limmaOut.WT, file = "RData/903-ASXL1_Tcell_limma_test.RData")
+save(limmaOut.EV, limmaOut.WT, file = "RData/903-ASXL1_Tcell_limma_test_ct_adjusted.RData")
+```
+
+#### Plotting Limma's hits
+
+```{r}
+beta <- adj.residuals
+
+beta <- beta[, c("HC1", "HC2", "HC3", "Dad", "Mom", "Sister", "P_EV", "P_WT ASXL1")] 
+plt <- beta[limmaOut.EV$Row.names, ] #%>% 
+    # .[order(.[, "P_EV"]), ] 
+    # using the SD5 definition
+pheatmap(plt[sample(1:nrow(plt),50000),], # cannot plot all 
+         show_rownames = F, 
+         scale = "row", 
+         treeheight_row = 0, 
+         cluster_cols = F,
+         cluster_rows = T) # do not show clustering
+pheatmap(plt[sample(1:nrow(plt),50000),], # cannot plot all 
+         show_rownames = F, 
+         scale = "none", 
+         treeheight_row = 0, 
+         cluster_cols = F,
+         cluster_rows = T) # do not show clustering
+plt <- beta[limmaOut.WT$Row.names, ] #%>% 
+    # .[order(.[, "P_EV"]), ] 
+    # using the SD5 definition
+pheatmap(plt, # cannot plot all 
+         show_rownames = F, 
+         scale = "row", 
+         treeheight_row = 0, 
+         cluster_cols = F,
+         cluster_rows = T) # do not show clustering
+pheatmap(plt, # cannot plot all 
+         show_rownames = F, 
+         scale = "none", 
+         treeheight_row = 0, 
+         cluster_cols = F,
+         cluster_rows = T) # do not show clustering
+
+plt <- beta[limmaOut.shared, ] #%>% 
+    # .[order(.[, "P_EV"]), ] 
+    # using the SD5 definition
+pheatmap(plt, # cannot plot all 
+         show_rownames = F, 
+         scale = "row", 
+         treeheight_row = 0, 
+         cluster_cols = F,
+         cluster_rows = T) # do not show clustering
+pheatmap(plt, # cannot plot all 
+         show_rownames = F, 
+         scale = "none", 
+         treeheight_row = 0, 
+         cluster_cols = F,
+         cluster_rows = T) # do not show clustering
+```
+
+
+#### Enrichment analysis on Limma's result
+
+```{r}
+genes_EV <- limmaOut.EV$UCSC_RefGene_Name %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""]
+genes_EV_up <- limmaOut.EV_up$UCSC_RefGene_Name %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""]
+genes_EV_down <- limmaOut.EV_down$UCSC_RefGene_Name %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""]
+
+genes_WT <- limmaOut.WT$UCSC_RefGene_Name %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""]
+genes_WT_up <- limmaOut.WT_up$UCSC_RefGene_Name %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""]
+genes_WT_down <- limmaOut.WT_down$UCSC_RefGene_Name %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""]
+
+# Background genes measured on the array
+genes_universe <- anno$UCSC_RefGene_Name %>% 
+    strsplit2(., ";") %>%
+    as.vector() %>%
+    unique() %>%
+    .[. != ""] 
+
+# Hallmark enrichment - want to check IL2-STAT5 pathway
+h_gene_sets <- msigdbr(species = "human", category = "H")
+msigdbr_t2g <- h_gene_sets %>% 
+    dplyr::distinct(gs_name, gene_symbol) %>% 
+    as.data.frame 
+(pathway_EV <- enricher(gene = genes_EV, TERM2GENE = msigdbr_t2g, universe = genes_universe)) #"HALLMARK_MYOGENESIS" "HALLMARK_UV_RESPONSE_DN" "HALLMARK_APICAL_JUNCTION" "HALLMARK_ESTROGEN_RESPONSE_EARLY" "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION" "HALLMARK_KRAS_SIGNALING_DN" "HALLMARK_HEDGEHOG_SIGNALING" "HALLMARK_COAGULATION" "HALLMARK_NOTCH_SIGNALING" 
+(pathway_EV_up <- enricher(gene = genes_EV_up, TERM2GENE = msigdbr_t2g, universe = genes_universe)) #"HALLMARK_ESTROGEN_RESPONSE_EARLY" "HALLMARK_KRAS_SIGNALING_DN" "HALLMARK_APICAL_JUNCTION"                   "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION" "HALLMARK_WNT_BETA_CATENIN_SIGNALING" "HALLMARK_ANGIOGENESIS" "HALLMARK_UV_RESPONSE_DN" "HALLMARK_ESTROGEN_RESPONSE_LATE" "HALLMARK_NOTCH_SIGNALING"
+(pathway_EV_down <- enricher(gene = genes_EV_down, TERM2GENE = msigdbr_t2g, universe = genes_universe)) #"HALLMARK_MYOGENESIS" "HALLMARK_UV_RESPONSE_DN" "HALLMARK_APICAL_JUNCTION" "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION" "HALLMARK_COAGULATION" "HALLMARK_APICAL_SURFACE"
+
+(pathway_WT <- enricher(gene = genes_WT, TERM2GENE = msigdbr_t2g, universe = genes_universe)) #  "HALLMARK_UV_RESPONSE_DN" "HALLMARK_APICAL_JUNCTION"
+(pathway_WT_up <- enricher(gene = genes_WT_up, TERM2GENE = msigdbr_t2g, universe = genes_universe)) #"HALLMARK_UV_RESPONSE_DN"
+(pathway_WT_down <- enricher(gene = genes_EV_down, TERM2GENE = msigdbr_t2g, universe = genes_universe)) #"HALLMARK_MYOGENESIS"  "HALLMARK_UV_RESPONSE_DN" "HALLMARK_APICAL_JUNCTION" "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION" "HALLMARK_COAGULATION" "HALLMARK_APICAL_SURFACE"
+
+# Plot enrichment
+pathway_EV <- pathway_EV@result
+pathway_EV$log10Padj <- log10(pathway_EV$p.adjust)*-1
+ggplot(pathway_EV[pathway_EV$p.adjust < 0.05, ], aes(reorder(ID, log10Padj), log10Padj)) + geom_bar(stat = "identity") + coord_flip() + theme_bw() + labs(y = "Adjusted P-value (-log10)", x = "")
+pathway_WT <- pathway_WT@result
+pathway_WT$log10Padj <- log10(pathway_WT$p.adjust)*-1
+ggplot(pathway_WT[pathway_WT$p.adjust < 0.05, ], aes(reorder(ID, log10Padj), log10Padj)) + geom_bar(stat = "identity") + coord_flip() + theme_bw() + labs(y = "Adjusted P-value (-log10)", x = "")
+```
+
+##### Preranked GSEA - fgsea
+
+```{r}
+# Preranked GSEA
+# h_gene_sets_fgsea <- lapply(h_gene_sets$)
+limmaRank.EV <- limmaOut.EV$t
+names(limmaRank.EV) <- as.character(limmaOut.EV$Row.names)
+```
+
+##### GO enrichment - missMethyl
+
+```{r}
+# missMethyl GO enrichment
+GE_EV.go <- gometh(as.character(limmaOut.EV$Row.names),
+                   as.character(rownames(beta)), 
+                   "GO", "EPIC", T, anno = anno)
+plt <- GE_EV.go %>% .[order(.$P.DE), ]
+head(plt)
+plt$log10Padj <- log10(plt$FDR)*-1
+ggplot(plt[1:20, ], aes(reorder(TERM, log10Padj), log10Padj)) + geom_bar(stat = "identity") + coord_flip() + theme_bw() + labs(y = "Adjusted P-value (-log10)", x = "GO Gene Set Enrichment")
+
+GE_WT.go <- gometh(as.character(limmaOut.WT$Row.names),
+                   as.character(rownames(beta)), 
+                   "GO", "EPIC", T, anno = anno)
+plt <- GE_WT.go %>% .[order(.$P.DE), ]
+
+plt$log10Padj <- log10(plt$FDR)*-1
+ggplot(plt[1:20, ], aes(reorder(TERM, log10Padj), log10Padj)) + geom_bar(stat = "identity") + coord_flip() + theme_bw() + labs(y = "Adjusted P-value (-log10)", x = "GO Gene Set Enrichment")
+```
+
+##### ChromHMM enrichment - missMethyl
+
+```{r}
+load("RData/902-ASXL1_Tcell_betas_norm.RData")
+load("RData/903-ASXL1_Tcell_limma_test.RData")
+
+### ChromHMM (thank you Nicole for all the code and creating the annotation file)
+load("../../Reference/EPIC_Anno_ChromeHMM.RData")
+Chrom_df <- EPIC_Anno_ChromeHMM[rownames(beta), c("Name", "E034_TCells_State")]
+colnames(Chrom_df) <- c("Probe_ID", "region")
+ 
+ChromHMMset <- lapply(unique(Chrom_df$region), function(x){
+    cpgs <- Chrom_df$Probe_ID[Chrom_df$region == x]
+    id <- getMappedEntrezIDs(cpgs, array.type = "EPIC", anno = anno)
+    return(id$sig.eg)
+})
+names(ChromHMMset) <- unique(Chrom_df$region)
+pathChromHMM.EV <- gsameth(sig.cpg = rownames(limmaOut.EV), 
+                           all.cpg = rownames(beta), 
+                           collection = ChromHMMset, 
+                           array.type = "EPIC", 
+                           anno = anno) %>% .[order(.$FDR), ]
+pathChromHMM.EV$Term <- rownames(pathChromHMM.EV) %>% 
+    gsub("1_TssA", "Active TSS", .) %>%
+    gsub("2_TssFlnk", "Flanking TSS", .) %>% 
+    gsub("3_TssFlnkU", "Flanking TSS Upstream", .) %>% 
+    gsub("4_TssFlnkD", "Flanking TSS Downstream", .) %>% 
+    gsub("5_Tx", "Strong Transcription", .) %>% 
+    gsub("6_TxWk", "Weak Transcription", .) %>% 
+    gsub("7_EnhG1", "Genic Enhancer 1", .) %>% 
+    gsub("8_EnhG2", "Genic Enhancer 2", .) %>% 
+    gsub("9_EnhA1", "Active Enhancer 1", .) %>% 
+    gsub("10_EnhA2", "Active Enhancer 2", .) %>% 
+    gsub("11_EnhWk", "Weak Enhancer", .) %>% 
+    gsub("12_ZNF/Rpts", "ZNF genes & repeats", .) %>% 
+    gsub("13_Het", "Heterochromatin", .) %>% 
+    gsub("14_TssBiv", "Bivalent/Poised TSS", .) %>% 
+    gsub("15_EnhBiv", "Bivalent Enhancer", .) %>% 
+    gsub("16_ReprPC", "Repressed PolyComb", .) %>% 
+    gsub("17_ReprPCWk", "Weak Repressed PolyComb", .) %>% 
+    gsub("18_Quies", "	Quiescent/Low", .) 
+pathChromHMM.EV$log10Padj <- log10(pathChromHMM.EV$FDR)*-1
+
+
+pathChromHMM.WT <- gsameth(sig.cpg = rownames(limmaOut.WT), 
+                           all.cpg = rownames(beta), 
+                           collection = ChromHMMset, 
+                           array.type = "EPIC", 
+                           anno = anno) %>% .[order(.$FDR), ]
+pathChromHMM.WT$Term <- rownames(pathChromHMM.WT) %>% 
+    gsub("1_TssA", "Active TSS", .) %>%
+    gsub("2_TssFlnk", "Flanking TSS", .) %>% 
+    gsub("3_TssFlnkU", "Flanking TSS Upstream", .) %>% 
+    gsub("4_TssFlnkD", "Flanking TSS Downstream", .) %>% 
+    gsub("5_Tx", "Strong Transcription", .) %>% 
+    gsub("6_TxWk", "Weak Transcription", .) %>% 
+    gsub("7_EnhG1", "Genic Enhancer 1", .) %>% 
+    gsub("8_EnhG2", "Genic Enhancer 2", .) %>% 
+    gsub("9_EnhA1", "Active Enhancer 1", .) %>% 
+    gsub("10_EnhA2", "Active Enhancer 2", .) %>% 
+    gsub("11_EnhWk", "Weak Enhancer", .) %>% 
+    gsub("12_ZNF/Rpts", "ZNF genes & repeats", .) %>% 
+    gsub("13_Het", "	Heterochromatin", .) %>% 
+    gsub("14_TssBiv", "Bivalent/Poised TSS", .) %>% 
+    gsub("15_EnhBiv", "Bivalent Enhancer", .) %>% 
+    gsub("16_ReprPC", "Repressed PolyComb", .) %>% 
+    gsub("17_ReprPCWk", "Weak Repressed PolyComb", .) %>% 
+    gsub("18_Quies", "	Quiescent/Low", .) 
+pathChromHMM.WT$log10Padj <- log10(pathChromHMM.WT$FDR)*-1
+
+plt <- pathChromHMM.WT
+ggplot(plt, aes(reorder(Term, log10Padj), log10Padj)) + 
+    geom_bar(stat = "identity") + 
+    labs(y = "Adjusted P-value (-log10)", x = "ChromHMM 18 States Annotation in T-cells") + 
+    geom_hline(yintercept = log10(0.01)*-1, linetype = 'dashed', color = "gray") +
+    coord_flip() + 
+    theme_bw() + 
+    theme(text = element_text(size = 13)) + 
+    ylim(0, 180)
+```
+
+
+### Examine overlap
+
+```{r}
+refOut <- readRDS("RData/903-ASXL1_Tcell_global_test.rds")
+load("RData/903-ASXL1_Tcell_permutation_sign_test.RData")
+load("RData/903-ASXL1_Tcell_limma_test.RData")
+
+# Subset to hits
+limmaHits.EV <- limmaOut.EV
+limmaHits.WT <- limmaOut.WT
+refHits.EV <- refOut[refOut$SD5.test.pat == "s", ]
+refHits.WT <- refOut[refOut$SD5.test.res == "s", ]
+permHits.EV <- permOut.EV[permOut.EV$Hypo_pval < 1/7 | permOut.EV$Hyper_pval < 1/7, ]
+permHits.WT <- permOut.WT[permOut.WT$Hypo_pval < 1/7 | permOut.WT$Hyper_pval < 1/7, ]
+
+# Make Venn Diagram
+allHits.EV <- list(Outlier_test = rownames(refHits.EV),
+                   Permutation_test = rownames(permHits.EV),
+                   Limma_test = as.character(limmaHits.EV$Row.names))
+allHits.WT <- list(Outlier_test = rownames(refHits.WT),
+                   Permutation_test = rownames(permHits.WT),
+                   Limma_test = as.character(limmaHits.WT$Row.names))
+
+plot(euler(allHits.EV, shape = "ellipse"), quantities = TRUE)
+plot(euler(allHits.WT, shape = "ellipse"), quantities = TRUE)
+
+ggvenn(allHits.EV,
+       fill_color = c("#7890A8", "#A8A8A8", "#6A7E4F"),
+       stroke_size = 0.5, 
+       set_name_size = 4, 
+       fill_alpha = 0.7)
+
+ggvenn(allHits.WT,
+       fill_color = c("#7890A8", "#A8A8A8", "#6A7E4F"),
+       stroke_size = 0.5, 
+       set_name_size = 4, 
+       fill_alpha = 0.7)
+```
+
